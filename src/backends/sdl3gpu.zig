@@ -25,7 +25,7 @@ pub const c = blk: {
 /// Only available in sdl2
 extern "SDL_config" fn MACOS_enable_scroll_momentum() callconv(.c) void;
 
-pub const kind: dvui.enums.Backend = if (sdl3) .sdl3 else .sdl2;
+pub const kind: dvui.enums.Backend = .sdl3gpu;
 
 pub const SDLBackend = @This();
 pub const Context = *SDLBackend;
@@ -33,7 +33,8 @@ pub const Context = *SDLBackend;
 const log = std.log.scoped(.SDLBackend);
 
 window: *c.SDL_Window,
-renderer: *c.SDL_Renderer,
+device: *c.SDL_GPUDevice,
+
 ak_should_initialized: bool = dvui.accesskit_enabled,
 we_own_window: bool = false,
 touch_mouse_events: bool = false,
@@ -294,8 +295,8 @@ pub fn initWindow(options: InitOptions) !SDLBackend {
     return back;
 }
 
-pub fn init(window: *c.SDL_Window, renderer: *c.SDL_Renderer) SDLBackend {
-    return SDLBackend{ .window = window, .renderer = renderer };
+pub fn init(window: *c.SDL_Window, device: *c.SDL_GPUDevice) SDLBackend {
+    return SDLBackend{ .window = window, .device = device };
 }
 
 const SDL_ERROR = if (sdl3) bool else c_int;
@@ -564,7 +565,8 @@ pub fn deinit(self: *SDLBackend) void {
     }
 
     if (self.we_own_window) {
-        c.SDL_DestroyRenderer(self.renderer);
+        // c.SDL_DestroyRenderer(self.renderer);
+        c.SDL_DestroyGPUDevice(self.device);
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
     }
@@ -572,11 +574,7 @@ pub fn deinit(self: *SDLBackend) void {
 }
 
 pub fn renderPresent(self: *SDLBackend) !void {
-    if (sdl3) {
-        try toErr(c.SDL_RenderPresent(self.renderer), "SDL_RenderPresent in renderPresent");
-    } else {
-        c.SDL_RenderPresent(self.renderer);
-    }
+    _ = self;
 }
 
 pub fn backend(self: *SDLBackend) dvui.Backend {
@@ -629,42 +627,13 @@ pub fn preferredColorScheme(_: *SDLBackend) ?dvui.enums.ColorScheme {
 }
 
 pub fn begin(self: *SDLBackend, arena: std.mem.Allocator) !void {
-    self.arena = arena;
-    const size = self.pixelSize();
-    if (sdl3) {
-        try toErr(c.SDL_SetRenderClipRect(self.renderer, &c.SDL_Rect{
-            .x = 0,
-            .y = 0,
-            .w = @intFromFloat(size.w),
-            .h = @intFromFloat(size.h),
-        }), "SDL_SetRenderClipRect in begin");
-    } else {
-        try toErr(c.SDL_RenderSetClipRect(self.renderer, &c.SDL_Rect{
-            .x = 0,
-            .y = 0,
-            .w = @intFromFloat(size.w),
-            .h = @intFromFloat(size.h),
-        }), "SDL_SetRenderClipRect in begin");
-    }
+    _ = self;
+    _ = arena;
 }
 
 pub fn end(_: *SDLBackend) !void {}
 
 pub fn pixelSize(self: *SDLBackend) dvui.Size.Physical {
-    var w: i32 = undefined;
-    var h: i32 = undefined;
-    if (sdl3) {
-        toErr(
-            c.SDL_GetCurrentRenderOutputSize(self.renderer, &w, &h),
-            "SDL_GetCurrentRenderOutputSize in pixelSize",
-        ) catch return self.last_pixel_size;
-    } else {
-        toErr(
-            c.SDL_GetRendererOutputSize(self.renderer, &w, &h),
-            "SDL_GetRendererOutputSize in pixelSize",
-        ) catch return self.last_pixel_size;
-    }
-    self.last_pixel_size = .{ .w = @as(f32, @floatFromInt(w)), .h = @as(f32, @floatFromInt(h)) };
     return self.last_pixel_size;
 }
 
@@ -685,328 +654,73 @@ pub fn contentScale(self: *SDLBackend) f32 {
 }
 
 pub fn drawClippedTriangles(self: *SDLBackend, texture: ?dvui.Texture, vtx: []const dvui.Vertex, idx: []const u16, maybe_clipr: ?dvui.Rect.Physical) !void {
-    //std.debug.print("drawClippedTriangles:\n", .{});
-    //for (vtx) |v, i| {
-    //  std.debug.print("  {d} vertex {}\n", .{i, v});
-    //}
-    //for (idx) |id, i| {
-    //  std.debug.print("  {d} index {d}\n", .{i, id});
-    //}
-
-    var oldclip: c.SDL_Rect = undefined;
-
-    if (maybe_clipr) |clipr| {
-        if (sdl3) {
-            try toErr(
-                c.SDL_GetRenderClipRect(self.renderer, &oldclip),
-                "SDL_GetRenderClipRect in drawClippedTriangles",
-            );
-        } else {
-            c.SDL_RenderGetClipRect(self.renderer, &oldclip);
-        }
-
-        const clip = c.SDL_Rect{
-            .x = @intFromFloat(clipr.x),
-            .y = @intFromFloat(clipr.y),
-            .w = @intFromFloat(clipr.w),
-            .h = @intFromFloat(clipr.h),
-        };
-        if (sdl3) {
-            try toErr(
-                c.SDL_SetRenderClipRect(self.renderer, &clip),
-                "SDL_SetRenderClipRect in drawClippedTriangles",
-            );
-        } else {
-            try toErr(
-                c.SDL_RenderSetClipRect(self.renderer, &clip),
-                "SDL_RenderSetClipRect in drawClippedTriangles",
-            );
-        }
-    }
-
-    var tex: ?*c.SDL_Texture = null;
-    if (texture) |t| {
-        tex = @ptrCast(@alignCast(t.ptr));
-    }
-
-    if (sdl3) {
-        // not great, but seems sdl3 strictly accepts color only in floats
-        // TODO: review if better solution is possible
-        const vcols = try self.arena.alloc(c.SDL_FColor, vtx.len);
-        defer self.arena.free(vcols);
-        for (vcols, 0..) |*col, i| {
-            col.r = @as(f32, @floatFromInt(vtx[i].col.r)) / 255.0;
-            col.g = @as(f32, @floatFromInt(vtx[i].col.g)) / 255.0;
-            col.b = @as(f32, @floatFromInt(vtx[i].col.b)) / 255.0;
-            col.a = @as(f32, @floatFromInt(vtx[i].col.a)) / 255.0;
-        }
-
-        try toErr(c.SDL_RenderGeometryRaw(
-            self.renderer,
-            tex,
-            @as(*const f32, @ptrCast(&vtx[0].pos)),
-            @sizeOf(dvui.Vertex),
-            vcols.ptr,
-            @sizeOf(c.SDL_FColor),
-            @as(*const f32, @ptrCast(&vtx[0].uv)),
-            @sizeOf(dvui.Vertex),
-            @as(c_int, @intCast(vtx.len)),
-            idx.ptr,
-            @as(c_int, @intCast(idx.len)),
-            @sizeOf(u16),
-        ), "SDL_RenderGeometryRaw, in drawClippedTriangles");
-    } else {
-        try toErr(c.SDL_RenderGeometryRaw(
-            self.renderer,
-            tex,
-            @as(*const f32, @ptrCast(&vtx[0].pos)),
-            @sizeOf(dvui.Vertex),
-            @as(*const c.SDL_Color, @ptrCast(@alignCast(&vtx[0].col))),
-            @sizeOf(dvui.Vertex),
-            @as(*const f32, @ptrCast(&vtx[0].uv)),
-            @sizeOf(dvui.Vertex),
-            @as(c_int, @intCast(vtx.len)),
-            idx.ptr,
-            @as(c_int, @intCast(idx.len)),
-            @sizeOf(u16),
-        ), "SDL_RenderGeometryRaw in drawClippedTriangles");
-    }
-
-    if (maybe_clipr) |_| {
-        if (sdl3) {
-            try toErr(
-                c.SDL_SetRenderClipRect(self.renderer, &oldclip),
-                "SDL_SetRenderClipRect in drawClippedTriangles reset clip",
-            );
-        } else {
-            try toErr(
-                c.SDL_RenderSetClipRect(self.renderer, &oldclip),
-                "SDL_RenderSetClipRect in drawClippedTriangles reset clip",
-            );
-        }
-    }
+    _ = self;
+    _ = texture;
+    _ = vtx;
+    _ = idx;
+    _ = maybe_clipr;
 }
 
-pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) !dvui.Texture {
-    if (!sdl3) switch (interpolation) {
-        .nearest => _ = c.SDL_SetHint(c.SDL_HINT_RENDER_SCALE_QUALITY, "nearest"),
-        .linear => _ = c.SDL_SetHint(c.SDL_HINT_RENDER_SCALE_QUALITY, "linear"),
+pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height: u32, _: dvui.enums.TextureInterpolation) !dvui.Texture {
+    _ = self;
+    const new_pixels = std.heap.c_allocator.dupe(u8, pixels[0 .. width * height * 4]) catch @panic("Couldn't create texture: OOM");
+    return .{
+        .width = width,
+        .height = height,
+        .ptr = new_pixels.ptr,
     };
-
-    const surface = if (sdl3)
-        c.SDL_CreateSurfaceFrom(
-            @as(c_int, @intCast(width)),
-            @as(c_int, @intCast(height)),
-            c.SDL_PIXELFORMAT_ABGR8888,
-            @constCast(pixels),
-            @as(c_int, @intCast(4 * width)),
-        ) orelse return logErr("SDL_CreateSurfaceFrom in textureCreate")
-    else
-        c.SDL_CreateRGBSurfaceWithFormatFrom(
-            @constCast(pixels),
-            @as(c_int, @intCast(width)),
-            @as(c_int, @intCast(height)),
-            32,
-            @as(c_int, @intCast(4 * width)),
-            c.SDL_PIXELFORMAT_ABGR8888,
-        ) orelse return logErr("SDL_CreateRGBSurfaceWithFormatFrom in textureCreate");
-
-    defer if (sdl3) c.SDL_DestroySurface(surface) else c.SDL_FreeSurface(surface);
-
-    const texture = c.SDL_CreateTextureFromSurface(self.renderer, surface) orelse return logErr("SDL_CreateTextureFromSurface in textureCreate");
-    errdefer c.SDL_DestroyTexture(texture);
-
-    if (sdl3) try toErr(switch (interpolation) {
-        .nearest => c.SDL_SetTextureScaleMode(texture, c.SDL_SCALEMODE_NEAREST),
-        .linear => c.SDL_SetTextureScaleMode(texture, c.SDL_SCALEMODE_LINEAR),
-    }, "SDL_SetTextureScaleMode in textureCreates");
-
-    const pma_blend = c.SDL_ComposeCustomBlendMode(c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD, c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD);
-    try toErr(c.SDL_SetTextureBlendMode(texture, pma_blend), "SDL_SetTextureBlendMode in textureCreate");
-    return dvui.Texture{ .ptr = texture, .width = width, .height = height };
 }
 
-pub fn textureUpdate(_: *SDLBackend, texture: dvui.Texture, pixels: [*]const u8) !void {
-    if (comptime sdl3) {
-        const tx: [*c]c.SDL_Texture = @ptrCast(@alignCast(texture.ptr));
-        if (!c.SDL_UpdateTexture(tx, null, pixels, @intCast(texture.width * 4))) return error.TextureUpdate;
-    } else {
-        return dvui.Backend.TextureError.NotImplemented;
-    }
+pub fn textureCreateTarget(_: *SDLBackend, _: u32, _: u32, _: dvui.enums.TextureInterpolation) !dvui.TextureTarget {
+    return error.TextureCreate;
 }
 
-pub fn textureCreateTarget(self: *SDLBackend, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) !dvui.TextureTarget {
-    if (!sdl3) switch (interpolation) {
-        .nearest => _ = c.SDL_SetHint(c.SDL_HINT_RENDER_SCALE_QUALITY, "nearest"),
-        .linear => _ = c.SDL_SetHint(c.SDL_HINT_RENDER_SCALE_QUALITY, "linear"),
-    };
-
-    const texture = c.SDL_CreateTexture(
-        self.renderer,
-        c.SDL_PIXELFORMAT_ABGR8888,
-        c.SDL_TEXTUREACCESS_TARGET,
-        @intCast(width),
-        @intCast(height),
-    ) orelse return logErr("SDL_CreateTexture in textureCreateTarget");
-    errdefer c.SDL_DestroyTexture(texture);
-
-    if (sdl3) try toErr(switch (interpolation) {
-        .nearest => c.SDL_SetTextureScaleMode(texture, c.SDL_SCALEMODE_NEAREST),
-        .linear => c.SDL_SetTextureScaleMode(texture, c.SDL_SCALEMODE_LINEAR),
-    }, "SDL_SetTextureScaleMode in textureCreates");
-
-    const pma_blend = c.SDL_ComposeCustomBlendMode(c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD, c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD);
-    try toErr(
-        c.SDL_SetTextureBlendMode(texture, pma_blend),
-        "SDL_SetTextureBlendMode in textureCreateTarget",
-    );
-    //try toErr(c.SDL_SetTextureBlendMode(texture, c.SDL_BLENDMODE_BLEND), "SDL_SetTextureBlendMode in textureCreateTarget",);
-
-    // make sure texture starts out transparent
-    // null is the default render target
-    const old = c.SDL_GetRenderTarget(self.renderer);
-    defer toErr(
-        c.SDL_SetRenderTarget(self.renderer, old),
-        "SDL_SetRenderTarget in textureCreateTarget",
-    ) catch log.err("Could not reset render target", .{});
-
-    var oldBlend: c_uint = undefined;
-    try toErr(
-        c.SDL_GetRenderDrawBlendMode(self.renderer, &oldBlend),
-        "SDL_GetRenderDrawBlendMode in textureCreateTarget",
-    );
-    defer toErr(
-        c.SDL_SetRenderDrawBlendMode(self.renderer, oldBlend),
-        "SDL_SetRenderDrawBlendMode in textureCreateTarget",
-    ) catch log.err("Could not reset render blend mode", .{});
-
-    try toErr(
-        c.SDL_SetRenderTarget(self.renderer, texture),
-        "SDL_SetRenderTarget in textureCreateTarget",
-    );
-    try toErr(
-        c.SDL_SetRenderDrawBlendMode(self.renderer, c.SDL_BLENDMODE_NONE),
-        "SDL_SetRenderDrawBlendMode in textureCreateTarget",
-    );
-    try toErr(
-        c.SDL_SetRenderDrawColor(self.renderer, 0, 0, 0, 0),
-        "SDL_SetRenderDrawColor in textureCreateTarget",
-    );
-    try toErr(
-        c.SDL_RenderFillRect(self.renderer, null),
-        "SDL_RenderFillRect in textureCreateTarget",
-    );
-
-    return dvui.TextureTarget{ .ptr = texture, .width = width, .height = height };
-}
+pub fn renderTarget(_: *SDLBackend, _: ?dvui.TextureTarget) !void {}
 
 pub fn textureReadTarget(self: *SDLBackend, texture: dvui.TextureTarget, pixels_out: [*]u8) !void {
-    if (sdl3) {
-        // null is the default target
-        const orig_target = c.SDL_GetRenderTarget(self.renderer);
-        try toErr(c.SDL_SetRenderTarget(self.renderer, @ptrCast(@alignCast(texture.ptr))), "SDL_SetRenderTarget in textureReadTarget");
-        defer toErr(
-            c.SDL_SetRenderTarget(self.renderer, orig_target),
-            "SDL_SetRenderTarget in textureReadTarget",
-        ) catch log.err("Could not reset render target", .{});
+    _ = self;
+    _ = texture;
+    _ = pixels_out;
 
-        var surface: *c.SDL_Surface = c.SDL_RenderReadPixels(self.renderer, null) orelse
-            logErr("SDL_RenderReadPixels in textureReadTarget") catch
-            return dvui.Backend.TextureError.TextureRead;
-        defer c.SDL_DestroySurface(surface);
-
-        if (texture.width * texture.height != surface.*.w * surface.*.h) {
-            log.err(
-                "texture and target surface sizes did not match: texture {d} {d} surface {d} {d}\n",
-                .{ texture.width, texture.height, surface.*.w, surface.*.h },
-            );
-            return dvui.Backend.TextureError.TextureRead;
-        }
-
-        // TODO: most common format is RGBA8888, doing conversion during copy to pixels_out should be faster
-        if (surface.*.format != c.SDL_PIXELFORMAT_ABGR8888) {
-            surface = c.SDL_ConvertSurface(surface, c.SDL_PIXELFORMAT_ABGR8888) orelse
-                logErr("SDL_ConvertSurface in textureReadTarget") catch
-                return dvui.Backend.TextureError.TextureRead;
-        }
-        @memcpy(pixels_out[0 .. texture.width * texture.height * 4], @as(?[*]u8, @ptrCast(surface.*.pixels)).?[0 .. texture.width * texture.height * 4]);
-        return;
-    }
-
-    // If SDL picks directX11 as a rendering backend, it could not support
-    // SDL_PIXELFORMAT_ABGR8888 so this works around that.  For some reason sdl
-    // crashes if we ask it to do the conversion for us.
-    var swap_rb = true;
-    var info: c.SDL_RendererInfo = undefined;
-    try toErr(c.SDL_GetRendererInfo(self.renderer, &info), "SDL_GetRendererInfo in textureReadTarget");
-    //std.debug.print("renderer name {s} formats:\n", .{info.name});
-    for (0..info.num_texture_formats) |i| {
-        //std.debug.print("  {s}\n", .{c.SDL_GetPixelFormatName(info.texture_formats[i])});
-        if (info.texture_formats[i] == c.SDL_PIXELFORMAT_ABGR8888) {
-            swap_rb = false;
-        }
-    }
-
-    const orig_target = c.SDL_GetRenderTarget(self.renderer);
-    try toErr(c.SDL_SetRenderTarget(self.renderer, @ptrCast(texture.ptr)), "SDL_SetRenderTarget in textureReadTarget");
-    defer toErr(
-        c.SDL_SetRenderTarget(self.renderer, orig_target),
-        "SDL_SetRenderTarget in textureReadTarget",
-    ) catch log.err("Could not reset render target", .{});
-
-    toErr(
-        c.SDL_RenderReadPixels(
-            self.renderer,
-            null,
-            if (swap_rb) c.SDL_PIXELFORMAT_ARGB8888 else c.SDL_PIXELFORMAT_ABGR8888,
-            pixels_out,
-            @intCast(texture.width * 4),
-        ),
-        "SDL_RenderReadPixels in textureReadTarget",
-    ) catch return dvui.Backend.TextureError.TextureRead;
-
-    if (swap_rb) {
-        for (0..texture.width * texture.height) |i| {
-            const r = pixels_out[i * 4 + 0];
-            const b = pixels_out[i * 4 + 2];
-            pixels_out[i * 4 + 0] = b;
-            pixels_out[i * 4 + 2] = r;
-        }
-    }
+    // null is the default target
+    //         const orig_target = c.SDL_GetRenderTarget(self.renderer);
+    //         try toErr(c.SDL_SetRenderTarget(self.renderer, @ptrCast(@alignCast(texture.ptr))), "SDL_SetRenderTarget in textureReadTarget");
+    //         defer toErr(
+    //             c.SDL_SetRenderTarget(self.renderer, orig_target),
+    //             "SDL_SetRenderTarget in textureReadTarget",
+    //         ) catch log.err("Could not reset render target", .{});
+    //
+    //         var surface: *c.SDL_Surface = c.SDL_RenderReadPixels(self.renderer, null) orelse
+    //             logErr("SDL_RenderReadPixels in textureReadTarget") catch
+    //             return dvui.Backend.TextureError.TextureRead;
+    //         defer c.SDL_DestroySurface(surface);
+    //
+    //         if (texture.width * texture.height != surface.*.w * surface.*.h) {
+    //             log.err(
+    //                 "texture and target surface sizes did not match: texture {d} {d} surface {d} {d}\n",
+    //                 .{ texture.width, texture.height, surface.*.w, surface.*.h },
+    //             );
+    //             return dvui.Backend.TextureError.TextureRead;
+    //         }
+    //
+    //         // TODO: most common format is RGBA8888, doing conversion during copy to pixels_out should be faster
+    //         if (surface.*.format != c.SDL_PIXELFORMAT_ABGR8888) {
+    //             surface = c.SDL_ConvertSurface(surface, c.SDL_PIXELFORMAT_ABGR8888) orelse
+    //                 logErr("SDL_ConvertSurface in textureReadTarget") catch
+    //                 return dvui.Backend.TextureError.TextureRead;
+    //         }
+    //         @memcpy(pixels_out[0 .. texture.width * texture.height * 4], @as(?[*]u8, @ptrCast(surface.*.pixels)).?[0 .. texture.width * texture.height * 4]);
+    return;
 }
 
-pub fn textureDestroy(_: *SDLBackend, texture: dvui.Texture) void {
-    c.SDL_DestroyTexture(@as(*c.SDL_Texture, @ptrCast(@alignCast(texture.ptr))));
+pub fn textureDestroy(self: *SDLBackend, texture: dvui.Texture) void {
+    _ = self;
+    const ptr: [*]const u8 = @ptrCast(texture.ptr);
+    std.heap.c_allocator.free(ptr[0..(texture.width * texture.height * 4)]);
 }
 
-pub fn textureFromTarget(self: *SDLBackend, texture: dvui.TextureTarget) !dvui.Texture {
-    // SDL can't read from non-target textures, so read all the pixels and make a new texture
-    const pixels = try self.arena.alloc(u8, texture.width * texture.height * 4);
-    defer self.arena.free(pixels);
-    try self.textureReadTarget(texture, pixels.ptr);
-
-    c.SDL_DestroyTexture(@as(*c.SDL_Texture, @ptrCast(@alignCast(texture.ptr))));
-
-    return self.textureCreate(pixels.ptr, texture.width, texture.height, .linear);
-}
-
-pub fn renderTarget(self: *SDLBackend, texture: ?dvui.TextureTarget) !void {
-    const ptr: ?*anyopaque = if (texture) |tex| tex.ptr else null;
-    try toErr(c.SDL_SetRenderTarget(self.renderer, @ptrCast(@alignCast(ptr))), "SDL_SetRenderTarget in renderTarget");
-
-    // by default sdl sets an empty clip, let's ensure it is the full texture/screen
-    if (sdl3) {
-        // sdl3 crashes if w/h are too big, this seems to work
-        try toErr(
-            c.SDL_SetRenderClipRect(self.renderer, &c.SDL_Rect{ .x = 0, .y = 0, .w = 65536, .h = 65536 }),
-            "SDL_SetRenderClipRect in renderTarget",
-        );
-    } else {
-        try toErr(
-            c.SDL_RenderSetClipRect(self.renderer, &c.SDL_Rect{ .x = 0, .y = 0, .w = std.math.maxInt(c_int), .h = std.math.maxInt(c_int) }),
-            "SDL_RenderSetClipRect in renderTarget",
-        );
-    }
+pub fn textureFromTarget(_: *SDLBackend, texture: dvui.TextureTarget) !dvui.Texture {
+    return .{ .ptr = texture.ptr, .width = texture.width, .height = texture.height };
 }
 
 pub fn addEvent(self: *SDLBackend, win: *dvui.Window, event: c.SDL_Event) !bool {
@@ -1734,9 +1448,4 @@ fn appIterate(_: ?*anyopaque) callconv(.c) c.SDL_AppResult {
     appState.no_wait = false;
 
     return c.SDL_APP_CONTINUE;
-}
-
-test {
-    //std.debug.print("{s} backend test\n", .{if (sdl3) "SDL3" else "SDL2"});
-    std.testing.refAllDecls(@This());
 }

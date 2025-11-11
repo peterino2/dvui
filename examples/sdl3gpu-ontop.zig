@@ -16,7 +16,7 @@ const vsync = false;
 const show_demo = false;
 
 var window: *c.SDL_Window = undefined;
-var renderer: *c.SDL_Renderer = undefined;
+var device: *c.SDL_GPUDevice = undefined;
 
 /// This example shows how to use dvui for floating windows on top of an existing application
 /// - dvui renders only floating windows
@@ -33,7 +33,7 @@ pub fn main() !void {
     try app_init();
 
     // create SDL backend using existing window and renderer, app still owns the window/renderer
-    var backend = SDLBackend.init(window, renderer);
+    var backend = SDLBackend.init(window, device);
     defer backend.deinit();
 
     // init dvui Window (maps onto a single OS window)
@@ -73,28 +73,10 @@ pub fn main() !void {
         }
 
         // clear the window
-        _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        _ = c.SDL_RenderClear(renderer);
 
-        // draw some SDL stuff with dvui floating stuff in the middle
-        const rect: if (SDLBackend.sdl3) c.SDL_FRect else c.SDL_Rect = .{ .x = 10, .y = 10, .w = 20, .h = 20 };
-        var rect2 = rect;
-        _ = c.SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255);
-        _ = c.SDL_RenderFillRect(renderer, &rect2);
+        // draw hello-triangle with sdl-gpu
 
         dvui_floating_stuff();
-
-        rect2.x += 24;
-        _ = c.SDL_SetRenderDrawColor(renderer, 0, 255, 0, 255);
-        _ = c.SDL_RenderFillRect(renderer, &rect2);
-
-        rect2.x += 24;
-        _ = c.SDL_SetRenderDrawColor(renderer, 0, 0, 255, 255);
-        _ = c.SDL_RenderFillRect(renderer, &rect2);
-
-        _ = c.SDL_SetRenderDrawColor(renderer, 255, 0, 255, 255);
-
-        if (SDLBackend.sdl3) _ = c.SDL_RenderLine(renderer, rect.x, rect.y + 30, rect.x + 100, rect.y + 30) else _ = c.SDL_RenderDrawLine(renderer, rect.x, rect.y + 30, rect.x + 100, rect.y + 30);
 
         // marks end of dvui frame, don't call dvui functions after this
         // - sends all dvui stuff to backend for rendering, must be called before renderPresent()
@@ -114,7 +96,7 @@ pub fn main() !void {
         try backend.renderPresent();
     }
 
-    c.SDL_DestroyRenderer(renderer);
+    c.SDL_DestroyGPUDevice(device);
     c.SDL_DestroyWindow(window);
     c.SDL_Quit();
 }
@@ -172,27 +154,16 @@ fn app_init() !void {
     }
 
     const hidden_flag = if (dvui.accesskit_enabled) c.SDL_WINDOW_HIDDEN else 0;
-    if (SDLBackend.sdl3) {
-        window = c.SDL_CreateWindow("DVUI SDL Ontop Example", @as(c_int, @intCast(640)), @as(c_int, @intCast(480)), c.SDL_WINDOW_HIGH_PIXEL_DENSITY | c.SDL_WINDOW_RESIZABLE | hidden_flag) orelse {
-            std.debug.print("Failed to open window: {s}\n", .{c.SDL_GetError()});
-            return error.BackendError;
-        };
-        renderer = c.SDL_CreateRenderer(window, null) orelse {
-            std.debug.print("Failed to create renderer: {s}\n", .{c.SDL_GetError()});
-            return error.BackendError;
-        };
-    } else {
-        window = c.SDL_CreateWindow("DVUI SDL Ontop Example", c.SDL_WINDOWPOS_UNDEFINED, c.SDL_WINDOWPOS_UNDEFINED, @as(c_int, @intCast(640)), @as(c_int, @intCast(480)), c.SDL_WINDOW_ALLOW_HIGHDPI | c.SDL_WINDOW_RESIZABLE | hidden_flag) orelse {
-            std.debug.print("Failed to open window: {s}\n", .{c.SDL_GetError()});
-            return error.BackendError;
-        };
-        _ = c.SDL_SetHint(c.SDL_HINT_RENDER_SCALE_QUALITY, "linear");
-        renderer = c.SDL_CreateRenderer(window, -1, if (vsync) c.SDL_RENDERER_PRESENTVSYNC else 0) orelse {
-            std.debug.print("Failed to create renderer: {s}\n", .{c.SDL_GetError()});
-            return error.BackendError;
-        };
-    }
 
-    const pma_blend = c.SDL_ComposeCustomBlendMode(c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD, c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD);
-    _ = c.SDL_SetRenderDrawBlendMode(renderer, pma_blend);
+    window = c.SDL_CreateWindow("DVUI SDLGPU Ontop Example", @as(c_int, @intCast(640)), @as(c_int, @intCast(480)), c.SDL_WINDOW_HIGH_PIXEL_DENSITY | c.SDL_WINDOW_RESIZABLE | hidden_flag) orelse {
+        std.debug.print("Failed to open window: {s}\n", .{c.SDL_GetError()});
+        return error.BackendError;
+    };
+
+    device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL | c.SDL_GPU_SHADERFORMAT_MSL, true, null) orelse {
+        std.debug.print("Failed to create device: {s}\n", .{c.SDL_GetError()});
+        return error.BackendError;
+    };
+
+    std.debug.print("sdl gpu device created", .{});
 }

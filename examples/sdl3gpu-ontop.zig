@@ -165,5 +165,9 @@ fn app_init() !void {
         return error.BackendError;
     };
 
+    if (!c.SDL_ClaimWindowForGPUDevice(device, window)) {
+        return error.BackendError;
+    }
+
     std.debug.print("sdl gpu device created", .{});
 }

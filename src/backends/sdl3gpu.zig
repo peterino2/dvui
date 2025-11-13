@@ -32,8 +32,33 @@ pub const Context = *SDLBackend;
 
 const log = std.log.scoped(.SDLBackend);
 
+// Embedded shaders organized by format
+const spv_shaders = struct {
+    const vertex align(8) = @embedFile("sdl3gpu/compiled/spv/default.vertex.spv").*;
+    const fragment align(8) = @embedFile("sdl3gpu/compiled/spv/default.fragment.spv").*;
+};
+
+const msl_shaders = struct {
+    const vertex align(8) = @embedFile("sdl3gpu/compiled/msl/default.vertex.msl").*;
+    const fragment align(8) = @embedFile("sdl3gpu/compiled/msl/default.fragment.msl").*;
+};
+
+const dxil_shaders = struct {
+    const vertex align(8) = @embedFile("sdl3gpu/compiled/dxil/default.vertex.dxil").*;
+    const fragment align(8) = @embedFile("sdl3gpu/compiled/dxil/default.fragment.dxil").*;
+};
+
 window: *c.SDL_Window,
 device: *c.SDL_GPUDevice,
+
+// Pipeline and rendering resources
+pipeline: *c.SDL_GPUGraphicsPipeline = undefined,
+cmd: ?*c.SDL_GPUCommandBuffer = null,
+swapchain_texture: ?*c.SDL_GPUTexture = null,
+
+// Shader-related fields
+shaderformat: c.SDL_GPUShaderFormat = 0,
+shader_entrypoint: []const u8 = "main",
 
 ak_should_initialized: bool = dvui.accesskit_enabled,
 we_own_window: bool = false,
@@ -113,39 +138,21 @@ pub fn initWindow(options: InitOptions) !SDLBackend {
 
     errdefer c.SDL_DestroyWindow(window);
 
-    const renderer: *c.SDL_Renderer = if (!sdl3)
-        c.SDL_CreateRenderer(window, -1, @intCast(
-            c.SDL_RENDERER_TARGETTEXTURE | (if (options.vsync) c.SDL_RENDERER_PRESENTVSYNC else 0),
-        )) orelse return logErr("SDL_CreateRenderer in initWindow")
-    else blk: {
-        const props = c.SDL_CreateProperties();
-        defer c.SDL_DestroyProperties(props);
-
-        try toErr(
-            c.SDL_SetPointerProperty(props, c.SDL_PROP_RENDERER_CREATE_WINDOW_POINTER, window),
-            "SDL_SetPointerProperty in initWindow",
-        );
-
-        if (options.vsync) {
-            try toErr(
-                c.SDL_SetNumberProperty(props, c.SDL_PROP_RENDERER_CREATE_PRESENT_VSYNC_NUMBER, 1),
-                "SDL_SetNumberProperty in initWindow",
-            );
-        }
-
-        break :blk c.SDL_CreateRendererWithProperties(props) orelse return logErr("SDL_CreateRendererWithProperties in initWindow");
-    };
-    errdefer c.SDL_DestroyRenderer(renderer);
-
     // do premultiplied alpha blending:
     // * rendering to a texture and then rendering the texture works the same
     // * any filtering happening across pixels won't bleed in transparent rgb values
-    const pma_blend = c.SDL_ComposeCustomBlendMode(c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD, c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD);
-    try toErr(c.SDL_SetRenderDrawBlendMode(renderer, pma_blend), "SDL_SetRenderDrawBlendMode in initWindow");
+    // const pma_blend = c.SDL_ComposeCustomBlendMode(c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD, c.SDL_BLENDFACTOR_ONE, c.SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, c.SDL_BLENDOPERATION_ADD);
+    // try toErr(c.SDL_SetRenderDrawBlendMode(renderer, pma_blend), "SDL_SetRenderDrawBlendMode in initWindow");
 
-    var back = init(window, renderer);
+    const device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL | c.SDL_GPU_SHADERFORMAT_MSL, true, null) orelse {
+        std.debug.print("Failed to create device: {s}\n", .{c.SDL_GetError()});
+        return error.BackendError;
+    };
+    var back = init(window, device);
     back.ak_should_initialized = show_window_in_begin;
     back.we_own_window = true;
+
+    // TODO: May want to factor this out into shared code with the sdl3 backend
 
     if (sdl3) {
         back.initial_scale = c.SDL_GetDisplayContentScale(c.SDL_GetDisplayForWindow(window));
@@ -296,7 +303,146 @@ pub fn initWindow(options: InitOptions) !SDLBackend {
 }
 
 pub fn init(window: *c.SDL_Window, device: *c.SDL_GPUDevice) SDLBackend {
-    return SDLBackend{ .window = window, .device = device };
+    var back = SDLBackend{ .window = window, .device = device, .pipeline = undefined };
+    back.detectShaderFormat();
+    back.createPipeline() catch |err| {
+        log.err("Failed to create pipeline: {any}", .{err});
+        @panic("Pipeline creation failed");
+    };
+    return back;
+}
+
+fn detectShaderFormat(self: *SDLBackend) void {
+    const formats = c.SDL_GetGPUShaderFormats(self.device);
+
+    if (formats & c.SDL_GPU_SHADERFORMAT_SPIRV != 0) {
+        self.shaderformat = c.SDL_GPU_SHADERFORMAT_SPIRV;
+        self.shader_entrypoint = "main";
+        log.info("Using SPIR-V shaders", .{});
+    } else if (formats & c.SDL_GPU_SHADERFORMAT_MSL != 0) {
+        self.shaderformat = c.SDL_GPU_SHADERFORMAT_MSL;
+        self.shader_entrypoint = "main0";
+        log.info("Using MSL shaders", .{});
+    } else if (formats & c.SDL_GPU_SHADERFORMAT_DXIL != 0) {
+        self.shaderformat = c.SDL_GPU_SHADERFORMAT_DXIL;
+        self.shader_entrypoint = "main";
+        log.info("Using DXIL shaders", .{});
+    } else {
+        log.err("No supported shader format found!", .{});
+    }
+}
+
+fn getShaderExtension(self: *SDLBackend) []const u8 {
+    return switch (self.shaderformat) {
+        c.SDL_GPU_SHADERFORMAT_SPIRV => "spv",
+        c.SDL_GPU_SHADERFORMAT_MSL => "msl",
+        c.SDL_GPU_SHADERFORMAT_DXIL => "dxil",
+        else => "unknown",
+    };
+}
+
+pub fn loadShader(
+    self: *SDLBackend,
+    shader_code: []const u8,
+    stage: c.SDL_GPUShaderStage,
+    num_samplers: u32,
+    num_storage_textures: u32,
+    num_storage_buffers: u32,
+    num_uniform_buffers: u32,
+) !*c.SDL_GPUShader {
+    const stage_name: []const u8 = if (stage == c.SDL_GPU_SHADERSTAGE_VERTEX) "vertex" else "fragment";
+    log.info("Loading {s} {s} shader ({d} bytes)", .{ self.getShaderExtension(), stage_name, shader_code.len });
+
+    // Create shader
+    const shader_info = c.SDL_GPUShaderCreateInfo{
+        .code_size = shader_code.len,
+        .code = shader_code.ptr,
+        .entrypoint = self.shader_entrypoint.ptr,
+        .format = self.shaderformat,
+        .stage = stage,
+        .num_samplers = num_samplers,
+        .num_storage_textures = num_storage_textures,
+        .num_storage_buffers = num_storage_buffers,
+        .num_uniform_buffers = num_uniform_buffers,
+        .props = 0,
+    };
+
+    const shader = c.SDL_CreateGPUShader(self.device, &shader_info);
+    if (shader == null) {
+        log.err("Failed to create shader: {s}", .{c.SDL_GetError()});
+        return error.ShaderCreationFailed;
+    }
+
+    return shader.?;
+}
+
+pub fn loadShaders(
+    self: *SDLBackend,
+) !struct { vertex: *c.SDL_GPUShader, fragment: *c.SDL_GPUShader } {
+    // Select embedded shader data based on detected format
+    const vertex_data: []const u8, const fragment_data: []const u8 = switch (self.shaderformat) {
+        c.SDL_GPU_SHADERFORMAT_SPIRV => .{ &spv_shaders.vertex, &spv_shaders.fragment },
+        c.SDL_GPU_SHADERFORMAT_MSL => .{ &msl_shaders.vertex, &msl_shaders.fragment },
+        c.SDL_GPU_SHADERFORMAT_DXIL => .{ &dxil_shaders.vertex, &dxil_shaders.fragment },
+        else => return error.UnsupportedShaderFormat,
+    };
+
+    // Vertex shader: 0 samplers, 0 storage textures, 0 storage buffers, 0 uniform buffers
+    const vertex_shader = try self.loadShader(
+        vertex_data,
+        c.SDL_GPU_SHADERSTAGE_VERTEX,
+        0, // num_samplers
+        0, // num_storage_textures
+        0, // num_storage_buffers
+        0, // num_uniform_buffers
+    );
+
+    // Fragment shader: 1 sampler, 0 storage textures, 0 storage buffers, 0 uniform buffers
+    const fragment_shader = try self.loadShader(
+        fragment_data,
+        c.SDL_GPU_SHADERSTAGE_FRAGMENT,
+        1, // num_samplers
+        0, // num_storage_textures
+        0, // num_storage_buffers
+        0, // num_uniform_buffers
+    );
+
+    return .{ .vertex = vertex_shader, .fragment = fragment_shader };
+}
+
+pub fn createPipeline(self: *SDLBackend) !void {
+    // Load shaders
+    const shaders = try self.loadShaders();
+    defer c.SDL_ReleaseGPUShader(self.device, shaders.vertex);
+    defer c.SDL_ReleaseGPUShader(self.device, shaders.fragment);
+
+    // Get swapchain texture format
+    const swapchain_format = c.SDL_GetGPUSwapchainTextureFormat(self.device, self.window);
+
+    // Create color target description
+    var color_target = std.mem.zeroes(c.SDL_GPUColorTargetDescription);
+    color_target.format = swapchain_format;
+    color_target.blend_state = std.mem.zeroes(c.SDL_GPUColorTargetBlendState);
+
+    // Create pipeline info
+    var pipeline_info = std.mem.zeroes(c.SDL_GPUGraphicsPipelineCreateInfo);
+    pipeline_info.vertex_shader = shaders.vertex;
+    pipeline_info.fragment_shader = shaders.fragment;
+
+    // Set up target info
+    pipeline_info.target_info.num_color_targets = 1;
+    pipeline_info.target_info.color_target_descriptions = &color_target;
+
+    // Set rasterizer state
+    pipeline_info.rasterizer_state.fill_mode = c.SDL_GPU_FILLMODE_FILL;
+
+    // Create the pipeline
+    self.pipeline = c.SDL_CreateGPUGraphicsPipeline(self.device, &pipeline_info) orelse {
+        log.err("Failed to create graphics pipeline: {s}", .{c.SDL_GetError()});
+        return error.PipelineCreationFailed;
+    };
+
+    log.info("Graphics pipeline created successfully", .{});
 }
 
 const SDL_ERROR = if (sdl3) bool else c_int;
@@ -565,7 +711,9 @@ pub fn deinit(self: *SDLBackend) void {
     }
 
     if (self.we_own_window) {
-        // c.SDL_DestroyRenderer(self.renderer);
+        // Release GPU pipeline
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pipeline);
+
         c.SDL_DestroyGPUDevice(self.device);
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
@@ -574,7 +722,16 @@ pub fn deinit(self: *SDLBackend) void {
 }
 
 pub fn renderPresent(self: *SDLBackend) !void {
-    _ = self;
+    if (self.cmd != null) {
+        // Submit the command buffer
+        const submitted = c.SDL_SubmitGPUCommandBuffer(self.cmd);
+        if (!submitted) {
+            log.err("Failed to submit GPU command buffer: {s}", .{c.SDL_GetError()});
+            return error.CommandBufferSubmissionFailed;
+        }
+        self.cmd = null;
+        self.swapchain_texture = null;
+    }
 }
 
 pub fn backend(self: *SDLBackend) dvui.Backend {
@@ -627,8 +784,35 @@ pub fn preferredColorScheme(_: *SDLBackend) ?dvui.enums.ColorScheme {
 }
 
 pub fn begin(self: *SDLBackend, arena: std.mem.Allocator) !void {
-    _ = self;
-    _ = arena;
+    self.arena = arena;
+
+    // Acquire command buffer for this frame
+    self.cmd = c.SDL_AcquireGPUCommandBuffer(self.device);
+    if (self.cmd == null) {
+        log.err("Failed to acquire GPU command buffer: {s}", .{c.SDL_GetError()});
+        return error.BackendError;
+    }
+
+    // Acquire swapchain texture and clear it
+    var swapchain_texture: ?*c.SDL_GPUTexture = null;
+    if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(self.cmd.?, self.window, &swapchain_texture, null, null)) {
+        self.cmd = null;
+        return;
+    }
+
+    // Store swapchain texture for use in drawClippedTriangles
+    self.swapchain_texture = swapchain_texture;
+
+    // Clear the screen
+    // TODO: Make this clear optional in the future (allow application to control clear behavior)
+    var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
+    color_target.texture = swapchain_texture;
+    color_target.clear_color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 };
+    color_target.load_op = c.SDL_GPU_LOADOP_CLEAR;
+    color_target.store_op = c.SDL_GPU_STOREOP_STORE;
+
+    const render_pass = c.SDL_BeginGPURenderPass(self.cmd.?, &color_target, 1, null);
+    c.SDL_EndGPURenderPass(render_pass);
 }
 
 pub fn end(_: *SDLBackend) !void {}

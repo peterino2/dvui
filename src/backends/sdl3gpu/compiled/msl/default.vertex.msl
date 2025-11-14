@@ -12,17 +12,17 @@ struct main0_out
 
 struct main0_in
 {
-    float4 in_var_POSITION [[attribute(0)]];
-    float4 in_var_COLOR [[attribute(1)]];
-    float2 in_var_TEXCOORD0 [[attribute(2)]];
+    float4 in_var_TEXCOORD0 [[attribute(0)]];
+    float4 in_var_TEXCOORD1 [[attribute(1)]];
+    float2 in_var_TEXCOORD2 [[attribute(2)]];
 };
 
 vertex main0_out main0(main0_in in [[stage_in]])
 {
     main0_out out = {};
-    out.gl_Position = in.in_var_POSITION;
-    out.out_var_COLOR = in.in_var_COLOR;
-    out.out_var_TEXCOORD0 = in.in_var_TEXCOORD0;
+    out.gl_Position = in.in_var_TEXCOORD0;
+    out.out_var_COLOR = in.in_var_TEXCOORD1;
+    out.out_var_TEXCOORD0 = in.in_var_TEXCOORD2;
     return out;
 }
 

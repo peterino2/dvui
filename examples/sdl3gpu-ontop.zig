@@ -26,6 +26,9 @@ pub fn main() !void {
         // on windows graphical apps have no console, so output goes to nowhere - attach it manually. related: https://github.com/ziglang/zig/issues/4196
         dvui.Backend.Common.windowsAttachConsole() catch {};
     }
+    defer {
+        _ = gpa_instance.deinit();
+    }
     SDLBackend.enableSDLLogging();
     dvui.Examples.show_demo_window = show_demo;
 
@@ -33,7 +36,7 @@ pub fn main() !void {
     try app_init();
 
     // create SDL backend using existing window and renderer, app still owns the window/renderer
-    var backend = SDLBackend.init(window, device);
+    var backend = SDLBackend.init(window, device, gpa_instance.allocator());
     defer backend.deinit();
 
     // init dvui Window (maps onto a single OS window)
@@ -96,7 +99,9 @@ pub fn main() !void {
         try backend.renderPresent();
     }
 
-    c.SDL_DestroyGPUDevice(device);
+    backend.destroyDeviceOnExit = true;
+    // c.SDL_DestroyGPUDevice(device);
+
     c.SDL_DestroyWindow(window);
     c.SDL_Quit();
 }

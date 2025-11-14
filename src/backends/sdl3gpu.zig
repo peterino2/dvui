@@ -48,13 +48,29 @@ const dxil_shaders = struct {
     const fragment align(8) = @embedFile("sdl3gpu/compiled/dxil/default.fragment.dxil").*;
 };
 
+// Backend texture that references one of the shared samplers
+const BackendTexture = struct {
+    texture: *c.SDL_GPUTexture,
+    sampler: *c.SDL_GPUSampler, // points to either linear_sampler or nearest_sampler
+};
+
 window: *c.SDL_Window,
 device: *c.SDL_GPUDevice,
+
+destroyDeviceOnExit: bool = false,
 
 // Pipeline and rendering resources
 pipeline: *c.SDL_GPUGraphicsPipeline = undefined,
 cmd: ?*c.SDL_GPUCommandBuffer = null,
 swapchain_texture: ?*c.SDL_GPUTexture = null,
+
+// Shared samplers for all textures
+linear_sampler: *c.SDL_GPUSampler = undefined,
+nearest_sampler: *c.SDL_GPUSampler = undefined,
+
+// Shared transfer buffer for texture uploads
+transfer_buffer: *c.SDL_GPUTransferBuffer = undefined,
+transfer_buffer_size: u32 = undefined,
 
 // Shader-related fields
 shaderformat: c.SDL_GPUShaderFormat = 0,
@@ -71,6 +87,7 @@ cursor_last: dvui.enums.Cursor = .arrow,
 cursor_backing: [@typeInfo(dvui.enums.Cursor).@"enum".fields.len]?*c.SDL_Cursor = [_]?*c.SDL_Cursor{null} ** @typeInfo(dvui.enums.Cursor).@"enum".fields.len,
 cursor_backing_tried: [@typeInfo(dvui.enums.Cursor).@"enum".fields.len]bool = [_]bool{false} ** @typeInfo(dvui.enums.Cursor).@"enum".fields.len,
 arena: std.mem.Allocator = undefined,
+textures_arena: std.heap.ArenaAllocator = undefined,
 
 pub const InitOptions = struct {
     /// The allocator used for temporary allocations used during init()
@@ -148,7 +165,7 @@ pub fn initWindow(options: InitOptions) !SDLBackend {
         std.debug.print("Failed to create device: {s}\n", .{c.SDL_GetError()});
         return error.BackendError;
     };
-    var back = init(window, device);
+    var back = init(window, device, options.allocator);
     back.ak_should_initialized = show_window_in_begin;
     back.we_own_window = true;
 
@@ -302,12 +319,25 @@ pub fn initWindow(options: InitOptions) !SDLBackend {
     return back;
 }
 
-pub fn init(window: *c.SDL_Window, device: *c.SDL_GPUDevice) SDLBackend {
-    var back = SDLBackend{ .window = window, .device = device, .pipeline = undefined };
+pub fn init(window: *c.SDL_Window, device: *c.SDL_GPUDevice, allocator: std.mem.Allocator) SDLBackend {
+    var back = SDLBackend{
+        .window = window,
+        .device = device,
+        .pipeline = undefined,
+        .textures_arena = std.heap.ArenaAllocator.init(allocator),
+    };
     back.detectShaderFormat();
     back.createPipeline() catch |err| {
         log.err("Failed to create pipeline: {any}", .{err});
         @panic("Pipeline creation failed");
+    };
+    back.createSamplers() catch |err| {
+        log.err("Failed to create samplers: {any}", .{err});
+        @panic("Sampler creation failed");
+    };
+    back.createTransferBuffer() catch |err| {
+        log.err("Failed to create transfer buffer: {any}", .{err});
+        @panic("Transfer buffer creation failed");
     };
     return back;
 }
@@ -391,20 +421,20 @@ pub fn loadShaders(
     const vertex_shader = try self.loadShader(
         vertex_data,
         c.SDL_GPU_SHADERSTAGE_VERTEX,
-        0, // num_samplers
-        0, // num_storage_textures
-        0, // num_storage_buffers
-        0, // num_uniform_buffers
+        0,
+        0,
+        0,
+        0,
     );
 
     // Fragment shader: 1 sampler, 0 storage textures, 0 storage buffers, 0 uniform buffers
     const fragment_shader = try self.loadShader(
         fragment_data,
         c.SDL_GPU_SHADERSTAGE_FRAGMENT,
-        1, // num_samplers
-        0, // num_storage_textures
-        0, // num_storage_buffers
-        0, // num_uniform_buffers
+        1,
+        0,
+        0,
+        0,
     );
 
     return .{ .vertex = vertex_shader, .fragment = fragment_shader };
@@ -428,12 +458,8 @@ pub fn createPipeline(self: *SDLBackend) !void {
     var pipeline_info = std.mem.zeroes(c.SDL_GPUGraphicsPipelineCreateInfo);
     pipeline_info.vertex_shader = shaders.vertex;
     pipeline_info.fragment_shader = shaders.fragment;
-
-    // Set up target info
     pipeline_info.target_info.num_color_targets = 1;
     pipeline_info.target_info.color_target_descriptions = &color_target;
-
-    // Set rasterizer state
     pipeline_info.rasterizer_state.fill_mode = c.SDL_GPU_FILLMODE_FILL;
 
     // Create the pipeline
@@ -443,6 +469,77 @@ pub fn createPipeline(self: *SDLBackend) !void {
     };
 
     log.info("Graphics pipeline created successfully", .{});
+}
+
+pub fn createSamplers(self: *SDLBackend) !void {
+    // Create linear sampler
+    const linear_sampler_info = c.SDL_GPUSamplerCreateInfo{
+        .min_filter = c.SDL_GPU_FILTER_LINEAR,
+        .mag_filter = c.SDL_GPU_FILTER_LINEAR,
+        .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
+        .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .mip_lod_bias = 0.0,
+        .max_anisotropy = 1.0,
+        .compare_op = c.SDL_GPU_COMPAREOP_NEVER,
+        .min_lod = 0.0,
+        .max_lod = 1000.0,
+        .enable_anisotropy = false,
+        .enable_compare = false,
+        .props = 0,
+    };
+
+    self.linear_sampler = c.SDL_CreateGPUSampler(self.device, &linear_sampler_info) orelse {
+        log.err("Failed to create linear sampler: {s}", .{c.SDL_GetError()});
+        return error.SamplerCreationFailed;
+    };
+
+    // Create nearest sampler
+    const nearest_sampler_info = c.SDL_GPUSamplerCreateInfo{
+        .min_filter = c.SDL_GPU_FILTER_NEAREST,
+        .mag_filter = c.SDL_GPU_FILTER_NEAREST,
+        .mipmap_mode = c.SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
+        .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .mip_lod_bias = 0.0,
+        .max_anisotropy = 1.0,
+        .compare_op = c.SDL_GPU_COMPAREOP_NEVER,
+        .min_lod = 0.0,
+        .max_lod = 1000.0,
+        .enable_anisotropy = false,
+        .enable_compare = false,
+        .props = 0,
+    };
+
+    self.nearest_sampler = c.SDL_CreateGPUSampler(self.device, &nearest_sampler_info) orelse {
+        log.err("Failed to create nearest sampler: {s}", .{c.SDL_GetError()});
+        return error.SamplerCreationFailed;
+    };
+
+    log.info("Samplers created successfully", .{});
+}
+
+pub fn createTransferBuffer(self: *SDLBackend) !void {
+    // Create a transfer buffer large enough for a 2048x2048 RGBA texture
+    // This should handle most UI textures. Larger textures will be handled specially.
+    const max_texture_size = 2048;
+    self.transfer_buffer_size = max_texture_size * max_texture_size * 4; // RGBA
+
+    self.transfer_buffer = c.SDL_CreateGPUTransferBuffer(
+        self.device,
+        &c.SDL_GPUTransferBufferCreateInfo{
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .size = self.transfer_buffer_size,
+            .props = 0,
+        },
+    ) orelse {
+        log.err("Failed to create transfer buffer: {s}", .{c.SDL_GetError()});
+        return error.TransferBufferCreationFailed;
+    };
+
+    log.info("Transfer buffer created: {} bytes", .{self.transfer_buffer_size});
 }
 
 const SDL_ERROR = if (sdl3) bool else c_int;
@@ -711,13 +808,23 @@ pub fn deinit(self: *SDLBackend) void {
     }
 
     if (self.we_own_window) {
-        // Release GPU pipeline
+        // Release GPU resources
+        c.SDL_ReleaseGPUTransferBuffer(self.device, self.transfer_buffer);
+        c.SDL_ReleaseGPUSampler(self.device, self.linear_sampler);
+        c.SDL_ReleaseGPUSampler(self.device, self.nearest_sampler);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pipeline);
 
+        // Clean up textures arena
         c.SDL_DestroyGPUDevice(self.device);
         c.SDL_DestroyWindow(self.window);
         c.SDL_Quit();
+    } else if (self.destroyDeviceOnExit) {
+        c.SDL_DestroyGPUDevice(self.device);
     }
+
+    self.textures_arena.deinit();
+
+    log.info("sdl3gpu backend deinitialized", .{});
     self.* = undefined;
 }
 
@@ -845,13 +952,106 @@ pub fn drawClippedTriangles(self: *SDLBackend, texture: ?dvui.Texture, vtx: []co
     _ = maybe_clipr;
 }
 
-pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height: u32, _: dvui.enums.TextureInterpolation) !dvui.Texture {
-    _ = self;
-    const new_pixels = std.heap.c_allocator.dupe(u8, pixels[0 .. width * height * 4]) catch @panic("Couldn't create texture: OOM");
-    return .{
+pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) !dvui.Texture {
+    // 1. Create GPU texture
+    const texture = c.SDL_CreateGPUTexture(
+        self.device,
+        &c.SDL_GPUTextureCreateInfo{
+            .type = c.SDL_GPU_TEXTURETYPE_2D,
+            .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            .width = width,
+            .height = height,
+            .layer_count_or_depth = 1,
+            .num_levels = 1,
+            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+            .props = 0,
+        },
+    ) orelse {
+        log.err("Failed to create GPU texture: {s}", .{c.SDL_GetError()});
+        return error.TextureCreate;
+    };
+    errdefer c.SDL_ReleaseGPUTexture(self.device, texture);
+
+    // 2. Check if texture fits in shared transfer buffer
+    const pixel_data_size = width * height * 4; // RGBA
+    if (pixel_data_size > self.transfer_buffer_size) {
+        log.err("Texture too large for transfer buffer: {} x {} (needs {} bytes, have {} bytes)", .{ width, height, pixel_data_size, self.transfer_buffer_size });
+        return error.TextureCreate;
+    }
+
+    // 3. Map and copy pixel data to shared transfer buffer
+    const mapped = c.SDL_MapGPUTransferBuffer(
+        self.device,
+        self.transfer_buffer,
+        false,
+    ) orelse {
+        log.err("Failed to map transfer buffer: {s}", .{c.SDL_GetError()});
+        return error.TextureCreate;
+    };
+    @memcpy(
+        @as([*]u8, @ptrCast(mapped))[0..pixel_data_size],
+        pixels[0..pixel_data_size],
+    );
+    c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer_buffer);
+
+    // 4. Upload to GPU
+    const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
+        log.err("Failed to acquire command buffer for texture upload: {s}", .{c.SDL_GetError()});
+        return error.TextureCreate;
+    };
+
+    const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buffer) orelse {
+        log.err("Failed to begin copy pass: {s}", .{c.SDL_GetError()});
+        return error.TextureCreate;
+    };
+
+    c.SDL_UploadToGPUTexture(
+        copy_pass,
+        &c.SDL_GPUTextureTransferInfo{
+            .transfer_buffer = self.transfer_buffer,
+            .offset = 0,
+            .pixels_per_row = 0,
+            .rows_per_layer = 0,
+        },
+        &c.SDL_GPUTextureRegion{
+            .texture = texture,
+            .mip_level = 0,
+            .layer = 0,
+            .x = 0,
+            .y = 0,
+            .z = 0,
+            .w = width,
+            .h = height,
+            .d = 1,
+        },
+        false,
+    );
+
+    c.SDL_EndGPUCopyPass(copy_pass);
+
+    if (!c.SDL_SubmitGPUCommandBuffer(cmd_buffer)) {
+        log.err("Failed to submit command buffer for texture upload: {s}", .{c.SDL_GetError()});
+        return error.TextureCreate;
+    }
+
+    // 5. Allocate BackendTexture from arena and set sampler
+    const backendTexture = try self.textures_arena.allocator().create(BackendTexture);
+
+    backendTexture.* = .{
+        .texture = texture,
+        .sampler = switch (interpolation) {
+            .linear => self.linear_sampler,
+            .nearest => self.nearest_sampler,
+        },
+    };
+
+    log.info("texture created size {d}x{d} 0x{x}", .{ width, height, @intFromPtr(backendTexture.texture) });
+
+    return dvui.Texture{
+        .ptr = backendTexture,
         .width = width,
         .height = height,
-        .ptr = new_pixels.ptr,
     };
 }
 
@@ -898,9 +1098,15 @@ pub fn textureReadTarget(self: *SDLBackend, texture: dvui.TextureTarget, pixels_
 }
 
 pub fn textureDestroy(self: *SDLBackend, texture: dvui.Texture) void {
-    _ = self;
-    const ptr: [*]const u8 = @ptrCast(texture.ptr);
-    std.heap.c_allocator.free(ptr[0..(texture.width * texture.height * 4)]);
+    const backendTexture: *BackendTexture = @ptrCast(@alignCast(texture.ptr));
+    log.info("texture destroyed {d}x{d} 0x{x}", .{
+        texture.width,
+        texture.height,
+        @intFromPtr(backendTexture.texture),
+    });
+    c.SDL_ReleaseGPUTexture(self.device, backendTexture.texture);
+    // Note: backendTexture itself is allocated from textures_arena and will be freed when arena is reset/deinit
+    // Samplers are shared and will be released in deinit()
 }
 
 pub fn textureFromTarget(_: *SDLBackend, texture: dvui.TextureTarget) !dvui.Texture {

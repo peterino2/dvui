@@ -31,7 +31,7 @@ PixelOutput main(PSInput input)
     //if ((input.position.x < 30.0)) //|| (input.position.x > r.x + r.w))// ||
         //(input.position.y < r.y) || (input.position.y > r.y + r.h)) 
     if ((input.position.x < r.x) || (input.position.x > r.x + r.w)  ||
-        (input.position.y < r.y) || (input.position.y > r.y + r.h)) 
+        (input.position.y < r.y) || (input.position.y > r.y + r.h - 2)) 
     {
         // o.Color = float4(1.0, 0.0, 0.0, 1.0);
         // return o;

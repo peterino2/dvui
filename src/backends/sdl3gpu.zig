@@ -170,7 +170,7 @@ const FrameUploads = struct {
             &c.SDL_GPUBufferRegion{
                 .buffer = self.vertex_gpu_buffer,
                 .offset = 0,
-                .size = @intCast(self.vertex_count * @sizeOf(dvui.Vertex)),
+                .size = @intCast(self.vertex_count * @sizeOf(Vertex)),
             },
             false,
         );
@@ -185,7 +185,7 @@ const FrameUploads = struct {
             &c.SDL_GPUBufferRegion{
                 .buffer = self.index_gpu_buffer,
                 .offset = 0,
-                .size = @intCast(self.index_count * @sizeOf(u16)),
+                .size = self.index_count * @sizeOf(u16),
             },
             false,
         );
@@ -211,8 +211,9 @@ const FrameUploads = struct {
         s.ptr = @ptrCast(@alignCast(vertex_mapped));
         s.len = @intCast(self.vertex_capacity);
 
+        const size = back.pixelSize();
         for (vtx, 0..) |v, i| {
-            s[self.vertex_count + i] = Vertex.fromDvui(v, back.pixelSize());
+            s[self.vertex_count + i] = Vertex.fromDvui(v, size);
         }
 
         c.SDL_UnmapGPUTransferBuffer(device, self.vertex_transfer_buffer);
@@ -231,7 +232,6 @@ const FrameUploads = struct {
         }
         c.SDL_UnmapGPUTransferBuffer(device, self.index_transfer_buffer);
 
-        // log.info("index count {d}", .{self.index_count});
         // Record draw call
         try self.draws.append(self.allocator, .{
             .index_start = self.index_count,
@@ -403,6 +403,14 @@ pub fn initWindow(options: InitOptions) !SDLBackend {
         std.debug.print("Failed to create device: {s}\n", .{c.SDL_GetError()});
         return error.BackendError;
     };
+
+    // Claim window for GPU device
+    if (!c.SDL_ClaimWindowForGPUDevice(device, window)) {
+        std.debug.print("Failed to claim window for GPU device: {s}\n", .{c.SDL_GetError()});
+        c.SDL_DestroyGPUDevice(device);
+        return error.BackendError;
+    }
+
     var back = init(window, device, options.allocator);
     back.ak_should_initialized = show_window_in_begin;
     back.we_own_window = true;
@@ -1271,6 +1279,17 @@ pub fn begin(self: *SDLBackend, arena: std.mem.Allocator) !void {
 }
 
 pub fn end(self: *SDLBackend) !void {
+    // Acquire swapchain texture for this frame
+    var swapchain_w: u32 = 0;
+    var swapchain_h: u32 = 0;
+    if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(self.cmd.?, self.window, &self.swapchain_texture, &swapchain_w, &swapchain_h)) {
+        log.err("Failed to acquire swapchain texture: {s}", .{c.SDL_GetError()});
+        _ = c.SDL_SubmitGPUCommandBuffer(self.cmd);
+        self.cmd = null;
+        self.swapchain_texture = null;
+        return;
+    }
+
     // Begin copy pass for uploading vertex/index data
     self.frame_uploads.copy_pass = c.SDL_BeginGPUCopyPass(self.cmd.?) orelse {
         log.err("Failed to begin GPU copy pass: {s}", .{c.SDL_GetError()});
@@ -1285,20 +1304,10 @@ pub fn end(self: *SDLBackend) !void {
         self.frame_uploads.copy_pass = null;
     }
 
-    // Acquire swapchain texture and clear it
-    var swapchain_texture: ?*c.SDL_GPUTexture = null;
-    if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(self.cmd.?, self.window, &swapchain_texture, null, null)) {
-        self.cmd = null;
-        return;
-    }
-
-    // Store swapchain texture for use in drawClippedTriangles
-    self.swapchain_texture = swapchain_texture;
-
-    // Start render pass (will be used by drawClippedTriangles calls)
+    // Use the swapchain texture acquired in begin() as render target
     // TODO: Make this clear optional in the future (allow application to control clear behavior)
     var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
-    color_target.texture = swapchain_texture;
+    color_target.texture = self.swapchain_texture;
     color_target.clear_color = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 };
     color_target.load_op = c.SDL_GPU_LOADOP_CLEAR;
     color_target.store_op = c.SDL_GPU_STOREOP_STORE;
@@ -1309,8 +1318,7 @@ pub fn end(self: *SDLBackend) !void {
         return error.BackendError;
     }
 
-    // iterate over frame_uploads and bind and render every RectDraw
-
+    // Iterate over frame_uploads and bind and render every draw call
     var vertexBuffer: c.SDL_GPUBufferBinding = .{ .buffer = self.frame_uploads.vertex_gpu_buffer, .offset = 0 };
     var indexBuffer: c.SDL_GPUBufferBinding = .{ .buffer = self.frame_uploads.index_gpu_buffer, .offset = 0 };
 
@@ -1328,7 +1336,7 @@ pub fn end(self: *SDLBackend) !void {
         c.SDL_DrawGPUIndexedPrimitives(self.current_render_pass, draw.index_count, 1, draw.index_start, 0, @intCast(i));
     }
 
-    // End the render pass started in begin()
+    // End the render pass
     if (self.current_render_pass) |pass| {
         c.SDL_EndGPURenderPass(pass);
         self.current_render_pass = null;
@@ -1336,6 +1344,14 @@ pub fn end(self: *SDLBackend) !void {
 }
 
 pub fn pixelSize(self: *SDLBackend) dvui.Size.Physical {
+    var w: i32 = undefined;
+    var h: i32 = undefined;
+    if (sdl3) {
+        toErr(c.SDL_GetWindowSizeInPixels(self.window, &w, &h), "SDL_GetWindowSizeInPixels in pixelSize") catch return self.last_pixel_size;
+    } else {
+        c.SDL_GetWindowSizeInPixels(self.window, &w, &h);
+    }
+    self.last_pixel_size = .{ .w = @floatFromInt(w), .h = @floatFromInt(h) };
     return self.last_pixel_size;
 }
 
@@ -1434,8 +1450,8 @@ pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height:
         &c.SDL_GPUTextureTransferInfo{
             .transfer_buffer = self.transfer_buffer,
             .offset = 0,
-            .pixels_per_row = 0,
-            .rows_per_layer = 0,
+            .pixels_per_row = width,
+            .rows_per_layer = height,
         },
         &c.SDL_GPUTextureRegion{
             .texture = texture,

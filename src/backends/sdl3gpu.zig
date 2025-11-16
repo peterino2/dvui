@@ -363,6 +363,7 @@ const Vertex = extern struct {
 window: *c.SDL_Window,
 device: *c.SDL_GPUDevice,
 
+first: bool = true,
 destroyDeviceOnExit: bool = false,
 
 // Pipeline and rendering resources
@@ -378,9 +379,9 @@ white_texture: *BackendTexture = undefined,
 linear_sampler: *c.SDL_GPUSampler = undefined,
 nearest_sampler: *c.SDL_GPUSampler = undefined,
 
-// Shared transfer buffer for texture uploads
-transfer_buffer: *c.SDL_GPUTransferBuffer = undefined,
-transfer_buffer_size: u32 = undefined,
+// list of linearly allocated buffers for transfers
+texture_transfers: std.ArrayList(TexTransferBuf) = .{},
+texture_transfer_index: usize = 0,
 
 // Rect uploads for batching geometry
 frame_uploads: FrameUploads = undefined,
@@ -401,6 +402,46 @@ cursor_backing: [@typeInfo(dvui.enums.Cursor).@"enum".fields.len]?*c.SDL_Cursor 
 cursor_backing_tried: [@typeInfo(dvui.enums.Cursor).@"enum".fields.len]bool = [_]bool{false} ** @typeInfo(dvui.enums.Cursor).@"enum".fields.len,
 arena: std.mem.Allocator = undefined,
 textures_arena: std.heap.ArenaAllocator = undefined,
+
+pub fn resetTextureTransfers(self: *@This()) void {
+    for (self.texture_transfers.items) |*transfer| {
+        transfer.reset();
+    }
+    self.texture_transfer_index = 0;
+}
+
+const max_texture_size = 2048 * 2048 * 4;
+pub const TexTransferBuf = struct {
+    transfer: *c.SDL_GPUTransferBuffer,
+    slice: []const u8,
+    fba: std.heap.FixedBufferAllocator,
+
+    pub fn init(device: *c.SDL_GPUDevice) @This() {
+        const buf = c.SDL_CreateGPUTransferBuffer(device, &c.SDL_GPUTransferBufferCreateInfo{
+            .size = max_texture_size,
+            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            .props = 0,
+        });
+
+        const p: [*]u8 = @ptrCast(@alignCast(c.SDL_MapGPUTransferBuffer(device, buf, false)));
+        const s = p[0..max_texture_size];
+
+        return @This(){
+            .transfer = buf.?,
+            .slice = s,
+            .fba = std.heap.FixedBufferAllocator.init(s),
+        };
+    }
+
+    pub fn reset(self: *@This()) void {
+        self.fba.reset();
+    }
+
+    pub fn deinit(self: *@This(), device: *c.SDL_GPUDevice) void {
+        c.SDL_UnmapGPUTransferBuffer(device, self.transfer);
+        c.SDL_ReleaseGPUTransferBuffer(device, self.transfer);
+    }
+};
 
 pub const InitOptions = struct {
     /// The allocator used for temporary allocations used during init()
@@ -656,14 +697,15 @@ pub fn init(window: *c.SDL_Window, device: *c.SDL_GPUDevice, allocator: std.mem.
         log.err("Failed to create samplers: {any}", .{err});
         @panic("Sampler creation failed");
     };
-    back.createTransferBuffer() catch |err| {
-        log.err("Failed to create transfer buffer: {any}", .{err});
-        @panic("Transfer buffer creation failed");
-    };
-    back.createWhiteTexture() catch |err| {
-        log.err("Failed to create white texture: {any}", .{err});
-        @panic("White texture creation failed");
-    };
+    back.texture_transfers.append(back.textures_arena.allocator(), TexTransferBuf.init(device)) catch @panic("unable to allocate");
+    // back.createTransferBuffer() catch |err| {
+    //     log.err("Failed to create transfer buffer: {any}", .{err});
+    //     @panic("Transfer buffer creation failed");
+    // };
+    // back.createWhiteTexture() catch |err| {
+    //     log.err("Failed to create white texture: {any}", .{err});
+    //     @panic("White texture creation failed");
+    // };
     back.frame_uploads = FrameUploads.init(device, allocator) catch |err| {
         log.err("Failed to create rect uploads: {any}", .{err});
         @panic("FrameUploads creation failed");
@@ -875,117 +917,22 @@ pub fn createSamplers(self: *SDLBackend) !void {
 
     log.info("Samplers created successfully", .{});
 }
-
-pub fn createTransferBuffer(self: *SDLBackend) !void {
-    // Create a transfer buffer large enough for a 2048x2048 RGBA texture
-    // This should handle most UI textures. Larger textures will be handled specially.
-    const max_texture_size = 2048;
-    self.transfer_buffer_size = max_texture_size * max_texture_size * 4; // RGBA
-
-    self.transfer_buffer = c.SDL_CreateGPUTransferBuffer(
-        self.device,
-        &c.SDL_GPUTransferBufferCreateInfo{
-            .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-            .size = self.transfer_buffer_size,
-            .props = 0,
-        },
-    ) orelse {
-        log.err("Failed to create transfer buffer: {s}", .{c.SDL_GetError()});
-        return error.TransferBufferCreationFailed;
-    };
-
-    log.info("Transfer buffer created: {} bytes", .{self.transfer_buffer_size});
-}
-
-pub fn createWhiteTexture(self: *SDLBackend) !void {
-    // Create a 1x1 white texture for non-textured draws
-    const white_pixel = [_]u8{ 255, 255, 255, 255 }; // RGBA white
-
-    // Create GPU texture
-    const texture = c.SDL_CreateGPUTexture(
-        self.device,
-        &c.SDL_GPUTextureCreateInfo{
-            .type = c.SDL_GPU_TEXTURETYPE_2D,
-            .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
-            .width = 1,
-            .height = 1,
-            .layer_count_or_depth = 1,
-            .num_levels = 1,
-            .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
-            .props = 0,
-        },
-    ) orelse {
-        log.err("Failed to create white texture: {s}", .{c.SDL_GetError()});
-        return error.TextureCreate;
-    };
-
-    // Upload white pixel data
-    const mapped = c.SDL_MapGPUTransferBuffer(
-        self.device,
-        self.transfer_buffer,
-        false,
-    ) orelse {
-        log.err("Failed to map transfer buffer for white texture: {s}", .{c.SDL_GetError()});
-        c.SDL_ReleaseGPUTexture(self.device, texture);
-        return error.TextureCreate;
-    };
-    @memcpy(@as([*]u8, @ptrCast(mapped))[0..4], &white_pixel);
-    c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer_buffer);
-
-    // Upload to GPU
-    const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
-        log.err("Failed to acquire command buffer for white texture: {s}", .{c.SDL_GetError()});
-        c.SDL_ReleaseGPUTexture(self.device, texture);
-        return error.TextureCreate;
-    };
-
-    const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buffer) orelse {
-        log.err("Failed to begin copy pass for white texture: {s}", .{c.SDL_GetError()});
-        c.SDL_ReleaseGPUTexture(self.device, texture);
-        return error.TextureCreate;
-    };
-
-    c.SDL_UploadToGPUTexture(
-        copy_pass,
-        &c.SDL_GPUTextureTransferInfo{
-            .transfer_buffer = self.transfer_buffer,
-            .offset = 0,
-            .pixels_per_row = 0,
-            .rows_per_layer = 0,
-        },
-        &c.SDL_GPUTextureRegion{
-            .texture = texture,
-            .mip_level = 0,
-            .layer = 0,
-            .x = 0,
-            .y = 0,
-            .z = 0,
-            .w = 1,
-            .h = 1,
-            .d = 1,
-        },
-        false,
-    );
-
-    c.SDL_EndGPUCopyPass(copy_pass);
-
-    if (!c.SDL_SubmitGPUCommandBuffer(cmd_buffer)) {
-        log.err("Failed to submit command buffer for white texture: {s}", .{c.SDL_GetError()});
-        c.SDL_ReleaseGPUTexture(self.device, texture);
-        return error.TextureCreate;
-    }
-
-    // Create BackendTexture with linear sampler
-    const backend_texture = try self.textures_arena.allocator().create(BackendTexture);
-    backend_texture.* = .{
-        .texture = texture,
-        .sampler = self.linear_sampler,
-    };
-
-    self.white_texture = backend_texture;
-    log.info("White texture created successfully", .{});
-}
+//     const white_pixel = [_]u8{ 255, 255, 255, 255 }; // RGBA white
+//
+//     // Create GPU texture
+//     const texture = c.SDL_CreateGPUTexture(
+//         self.device,
+//         &c.SDL_GPUTextureCreateInfo{
+//             .type = c.SDL_GPU_TEXTURETYPE_2D,
+//             .format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+//             .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER,
+//             .width = 1,
+//             .height = 1,
+//             .layer_count_or_depth = 1,
+//             .num_levels = 1,
+//             .sample_count = c.SDL_GPU_SAMPLECOUNT_1,
+//             .props = 0,
+//         },
 
 const SDL_ERROR = if (sdl3) bool else c_int;
 const SDL_SUCCESS: SDL_ERROR = if (sdl3) true else 0;
@@ -1252,18 +1199,19 @@ pub fn deinit(self: *SDLBackend) void {
         }
     }
 
-    // Clean up textures arena (always needed)
-    self.textures_arena.deinit();
-
     // Clean up rect uploads (always needed)
     self.frame_uploads.deinit(self.device);
 
+    c.SDL_ReleaseGPUTexture(self.device, self.white_texture.texture);
+    c.SDL_ReleaseGPUSampler(self.device, self.linear_sampler);
+    c.SDL_ReleaseGPUSampler(self.device, self.nearest_sampler);
+
+    for (self.texture_transfers.items) |*t| {
+        t.deinit(self.device);
+    }
+
     if (self.we_own_window) {
         // Release GPU resources
-        c.SDL_ReleaseGPUTexture(self.device, self.white_texture.texture);
-        c.SDL_ReleaseGPUTransferBuffer(self.device, self.transfer_buffer);
-        c.SDL_ReleaseGPUSampler(self.device, self.linear_sampler);
-        c.SDL_ReleaseGPUSampler(self.device, self.nearest_sampler);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pipeline);
 
         c.SDL_DestroyGPUDevice(self.device);
@@ -1273,6 +1221,8 @@ pub fn deinit(self: *SDLBackend) void {
         c.SDL_DestroyGPUDevice(self.device);
     }
 
+    // Clean up textures arena (always needed)
+    self.textures_arena.deinit();
     log.info("sdl3gpu backend deinitialized", .{});
     self.* = undefined;
 }
@@ -1348,12 +1298,6 @@ pub fn begin(self: *SDLBackend, arena: std.mem.Allocator) !void {
         log.err("Failed to acquire GPU command buffer: {s}", .{c.SDL_GetError()});
         return error.BackendError;
     }
-
-    // Reset rect uploads for this frame
-    self.frame_uploads.reset();
-}
-
-pub fn end(self: *SDLBackend) !void {
     // Acquire swapchain texture for this frame
     var swapchain_w: u32 = 0;
     var swapchain_h: u32 = 0;
@@ -1364,6 +1308,18 @@ pub fn end(self: *SDLBackend) !void {
         self.swapchain_texture = null;
         return;
     }
+
+    // Reset rect uploads for this frame
+    self.frame_uploads.reset();
+    self.resetTextureTransfers();
+
+    if (self.first) {
+        self.first = false;
+        self.white_texture = @ptrCast(@alignCast((self.textureCreate(&.{ 255, 255, 255, 255 }, 1, 1, .linear) catch unreachable).ptr));
+    }
+}
+
+pub fn end(self: *SDLBackend) !void {
 
     // Begin copy pass for uploading vertex/index data
     self.frame_uploads.copy_pass = c.SDL_BeginGPUCopyPass(self.cmd.?) orelse {
@@ -1467,6 +1423,38 @@ pub fn drawClippedTriangles(self: *SDLBackend, texture: ?dvui.Texture, vtx: []co
     };
 }
 
+pub fn advanceTextureTransfer(self: *@This()) !void {
+    self.texture_transfer_index += 1;
+
+    if (self.texture_transfer_index >= self.texture_transfers.items.len) {
+        try self.texture_transfers.append(self.textures_arena.allocator(), TexTransferBuf.init(self.device));
+    }
+}
+
+pub fn allocTransferBufferForTexture(self: *SDLBackend, texture_size: usize) !struct { mapped: []u8, transfer: *TexTransferBuf, start_offset: usize } {
+    if (texture_size > max_texture_size) {
+        @panic("Try increasing max_texture_size");
+    }
+
+    const spaceLeft = max_texture_size - self.texture_transfers.items[self.texture_transfer_index].fba.end_index;
+
+    if (spaceLeft < texture_size) {
+        try self.advanceTextureTransfer();
+    }
+
+    const transfer = &self.texture_transfers.items[self.texture_transfer_index];
+
+    const offset = transfer.fba.end_index;
+
+    const s = try transfer.fba.allocator().alloc(u8, texture_size);
+
+    return .{
+        .mapped = s,
+        .transfer = transfer,
+        .start_offset = offset,
+    };
+}
+
 pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height: u32, interpolation: dvui.enums.TextureInterpolation) !dvui.Texture {
     // 1. Create GPU texture
     const texture = c.SDL_CreateGPUTexture(
@@ -1490,31 +1478,20 @@ pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height:
 
     // 2. Check if texture fits in shared transfer buffer
     const pixel_data_size = width * height * 4; // RGBA
-    if (pixel_data_size > self.transfer_buffer_size) {
-        log.err("Texture too large for transfer buffer: {} x {} (needs {} bytes, have {} bytes)", .{ width, height, pixel_data_size, self.transfer_buffer_size });
+    if (pixel_data_size > max_texture_size) {
+        log.err("Texture too large for transfer buffer", .{});
         return error.TextureCreate;
     }
 
-    // 3. Map and copy pixel data to shared transfer buffer
-    const mapped = c.SDL_MapGPUTransferBuffer(
-        self.device,
-        self.transfer_buffer,
-        false,
-    ) orelse {
-        log.err("Failed to map transfer buffer: {s}", .{c.SDL_GetError()});
-        return error.TextureCreate;
-    };
+    const transfer_info = try self.allocTransferBufferForTexture(pixel_data_size);
+
     @memcpy(
-        @as([*]u8, @ptrCast(mapped))[0..pixel_data_size],
+        transfer_info.mapped.ptr,
         pixels[0..pixel_data_size],
     );
-    c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer_buffer);
 
     // 4. Upload to GPU
-    const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
-        log.err("Failed to acquire command buffer for texture upload: {s}", .{c.SDL_GetError()});
-        return error.TextureCreate;
-    };
+    const cmd_buffer = self.cmd;
 
     const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buffer) orelse {
         log.err("Failed to begin copy pass: {s}", .{c.SDL_GetError()});
@@ -1524,8 +1501,8 @@ pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height:
     c.SDL_UploadToGPUTexture(
         copy_pass,
         &c.SDL_GPUTextureTransferInfo{
-            .transfer_buffer = self.transfer_buffer,
-            .offset = 0,
+            .transfer_buffer = transfer_info.transfer.transfer,
+            .offset = @intCast(transfer_info.start_offset),
             .pixels_per_row = width,
             .rows_per_layer = height,
         },
@@ -1544,11 +1521,6 @@ pub fn textureCreate(self: *SDLBackend, pixels: [*]const u8, width: u32, height:
     );
 
     c.SDL_EndGPUCopyPass(copy_pass);
-
-    if (!c.SDL_SubmitGPUCommandBuffer(cmd_buffer)) {
-        log.err("Failed to submit command buffer for texture upload: {s}", .{c.SDL_GetError()});
-        return error.TextureCreate;
-    }
 
     // 5. Allocate BackendTexture from arena and set sampler
     const backendTexture = try self.textures_arena.allocator().create(BackendTexture);

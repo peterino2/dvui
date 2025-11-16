@@ -59,22 +59,200 @@ const RectDraw = struct {
     index_start: u32,
     index_count: u32,
     texture: *BackendTexture,
-    clipr: ?c.SDL_Rect = null, // todo
 };
+
+const ClipRect = extern struct {
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    w: f32 = 10000.0,
+    h: f32 = 10000.0,
+
+    pub fn fromDvui(rect: c.SDL_Rect, s: anytype) @This() {
+        _ = s;
+        return .{
+            .x = @as(f32, @floatFromInt(rect.x)),
+            .y = @as(f32, @floatFromInt(rect.y)),
+            .w = @as(f32, @floatFromInt(rect.w)),
+            .h = @as(f32, @floatFromInt(rect.h)),
+            // .x = @as(f32, @floatFromInt(rect.x)) / s.w * 2 - 1.0,
+            // .y = -(@as(f32, @floatFromInt(rect.y)) / s.h * 2 - 1.0),
+            // .w = @as(f32, @floatFromInt(rect.w)) / s.w * 2,
+            // .h = @as(f32, @floatFromInt(rect.h)) / s.h * 2,
+        };
+    }
+};
+
+fn UploadBuffer(comptime T: type) type {
+    return struct {
+        device: *c.SDL_GPUDevice,
+        usage: c.SDL_GPUBufferUsageFlags,
+        transfer: *c.SDL_GPUTransferBuffer,
+        buffer: *c.SDL_GPUBuffer,
+        mapped: [*]T,
+        cap: u32,
+        len: u32 = 0,
+
+        pub const element_size = @sizeOf(T);
+
+        pub fn init(device: *c.SDL_GPUDevice, capacity: u32, usage: c.SDL_GPUBufferUsageFlags) !@This() {
+            const buffer_size = capacity * element_size;
+
+            // Create vertex transfer buffer
+            const transfer = c.SDL_CreateGPUTransferBuffer(
+                device,
+                &c.SDL_GPUTransferBufferCreateInfo{
+                    .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+                    .size = buffer_size,
+                    .props = 0,
+                },
+            ) orelse return error.BufferCreationFailed;
+            errdefer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+            // Create vertex GPU buffer
+            const buffer = c.SDL_CreateGPUBuffer(
+                device,
+                &c.SDL_GPUBufferCreateInfo{
+                    .usage = usage,
+                    .size = buffer_size,
+                    .props = 0,
+                },
+            ) orelse return error.BufferCreationFailed;
+            errdefer c.SDL_ReleaseGPUBuffer(device, buffer);
+
+            return .{
+                .device = device,
+                .buffer = buffer,
+                .usage = usage,
+                .transfer = transfer,
+                .mapped = @ptrCast(@alignCast(c.SDL_MapGPUTransferBuffer(device, transfer, false))),
+                .cap = capacity,
+            };
+        }
+
+        pub fn reset(self: *@This()) void {
+            self.len = 0;
+        }
+
+        pub fn ensureCapacityPushCount(self: *@This(), push_count: usize) !void {
+            if (self.len + push_count >= self.cap) {
+                var new_size = self.cap;
+
+                while (new_size < self.len + push_count) {
+                    if (new_size > 10000) {
+                        new_size *= 2;
+                    } else {
+                        new_size += 2000;
+                    }
+                }
+
+                try self.resize(new_size);
+            }
+        }
+
+        pub fn pushAssumeCap(self: *@This(), new: T) void {
+            // TODO: do more measurements on wildly the element counts resize in dvui.
+            self.mapped[self.len] = new;
+            self.len += 1;
+        }
+
+        pub fn addUploads(self: *@This(), copy_pass: *c.SDL_GPUCopyPass) void {
+            c.SDL_UploadToGPUBuffer(
+                copy_pass,
+                &c.SDL_GPUTransferBufferLocation{
+                    .transfer_buffer = self.transfer,
+                    .offset = 0,
+                },
+                &c.SDL_GPUBufferRegion{
+                    .buffer = self.buffer,
+                    .offset = 0,
+                    .size = @intCast(self.len * element_size),
+                },
+                false,
+            );
+        }
+
+        pub fn deinit(self: *@This()) void {
+            c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer);
+            c.SDL_ReleaseGPUTransferBuffer(self.device, self.transfer);
+            c.SDL_ReleaseGPUBuffer(self.device, self.buffer);
+        }
+
+        pub fn resize(self: *@This(), new_cap: u32) !void {
+            const new_size = new_cap * element_size;
+
+            c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer);
+
+            const device = self.device;
+            const transfer = c.SDL_CreateGPUTransferBuffer(
+                device,
+                &c.SDL_GPUTransferBufferCreateInfo{
+                    .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+                    .size = new_size,
+                    .props = 0,
+                },
+            ) orelse return error.BufferCreationFailed;
+            errdefer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+            // Create vertex GPU buffer
+            const buffer = c.SDL_CreateGPUBuffer(
+                device,
+                &c.SDL_GPUBufferCreateInfo{
+                    .usage = self.usage,
+                    .size = new_size,
+                    .props = 0,
+                },
+            ) orelse return error.BufferCreationFailed;
+            errdefer c.SDL_ReleaseGPUBuffer(device, buffer);
+
+            // gpu copy pass, from old gpu buffer to new buffer
+
+            const cmd_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
+                log.err("Failed to acquire command buffer for resize: {s}", .{c.SDL_GetError()});
+                return error.ResizeFailed;
+            };
+
+            const copy_pass = c.SDL_BeginGPUCopyPass(cmd_buffer) orelse {
+                log.err("Failed to begin copyPass for resize: {s}", .{c.SDL_GetError()});
+                return error.ResizeFailed;
+            };
+
+            c.SDL_CopyGPUBufferToBuffer(
+                copy_pass,
+                &c.SDL_GPUBufferLocation{
+                    .buffer = self.buffer,
+                    .offset = 0,
+                },
+                &c.SDL_GPUBufferLocation{
+                    .buffer = buffer,
+                    .offset = 0,
+                },
+                self.cap * element_size,
+                false,
+            );
+
+            c.SDL_EndGPUCopyPass(copy_pass);
+
+            if (!c.SDL_SubmitGPUCommandBuffer(cmd_buffer)) {
+                log.err("Failed to submit command buffer for resize: {s}", .{c.SDL_GetError()});
+                return error.TextureCreate;
+            }
+
+            c.SDL_ReleaseGPUBuffer(self.device, self.buffer);
+            c.SDL_ReleaseGPUTransferBuffer(self.device, self.transfer);
+
+            self.buffer = buffer;
+            self.transfer = transfer;
+            self.cap = new_cap;
+            self.mapped = @ptrCast(@alignCast(c.SDL_MapGPUTransferBuffer(device, transfer, false)));
+        }
+    };
+}
 
 // Upload buffers for batching vertex/index data before rendering
 const FrameUploads = struct {
-    // Vertex buffers
-    vertex_transfer_buffer: *c.SDL_GPUTransferBuffer,
-    vertex_gpu_buffer: *c.SDL_GPUBuffer,
-    vertex_capacity: u32, // in number of vertices
-    vertex_count: u32, // current number of vertices uploaded
-
-    // Index buffers
-    index_transfer_buffer: *c.SDL_GPUTransferBuffer,
-    index_gpu_buffer: *c.SDL_GPUBuffer,
-    index_capacity: u32, // in number of indices
-    index_count: u32, // current number of indices uploaded
+    vertex: UploadBuffer(Vertex),
+    index: UploadBuffer(u16),
+    clip: UploadBuffer(ClipRect),
 
     // Draw calls tracking
     draws: std.ArrayList(RectDraw) = .{},
@@ -83,166 +261,63 @@ const FrameUploads = struct {
     // Copy pass for uploading data each frame
     copy_pass: ?*c.SDL_GPUCopyPass = null,
 
-    fn init(device: *c.SDL_GPUDevice, allocator: std.mem.Allocator, vertex_capacity: u32, index_capacity: u32) !FrameUploads {
-        const vertex_size = vertex_capacity * @sizeOf(dvui.Vertex);
-        const index_size = index_capacity * @sizeOf(u16);
-
-        // Create vertex transfer buffer
-        const vertex_transfer = c.SDL_CreateGPUTransferBuffer(
-            device,
-            &c.SDL_GPUTransferBufferCreateInfo{
-                .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-                .size = vertex_size,
-                .props = 0,
-            },
-        ) orelse return error.BufferCreationFailed;
-        errdefer c.SDL_ReleaseGPUTransferBuffer(device, vertex_transfer);
-
-        // Create vertex GPU buffer
-        const vertex_gpu = c.SDL_CreateGPUBuffer(
-            device,
-            &c.SDL_GPUBufferCreateInfo{
-                .usage = c.SDL_GPU_BUFFERUSAGE_VERTEX,
-                .size = vertex_size,
-                .props = 0,
-            },
-        ) orelse return error.BufferCreationFailed;
-        errdefer c.SDL_ReleaseGPUBuffer(device, vertex_gpu);
-
-        // Create index transfer buffer
-        const index_transfer = c.SDL_CreateGPUTransferBuffer(
-            device,
-            &c.SDL_GPUTransferBufferCreateInfo{
-                .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-                .size = index_size,
-                .props = 0,
-            },
-        ) orelse return error.BufferCreationFailed;
-        errdefer c.SDL_ReleaseGPUTransferBuffer(device, index_transfer);
-
-        // Create index GPU buffer
-        const index_gpu = c.SDL_CreateGPUBuffer(
-            device,
-            &c.SDL_GPUBufferCreateInfo{
-                .usage = c.SDL_GPU_BUFFERUSAGE_INDEX,
-                .size = index_size,
-                .props = 0,
-            },
-        ) orelse return error.BufferCreationFailed;
-
+    fn init(device: *c.SDL_GPUDevice, allocator: std.mem.Allocator) !FrameUploads {
         return .{
-            .vertex_transfer_buffer = vertex_transfer,
-            .vertex_gpu_buffer = vertex_gpu,
-            .vertex_capacity = vertex_capacity,
-            .vertex_count = 0,
-            .index_transfer_buffer = index_transfer,
-            .index_gpu_buffer = index_gpu,
-            .index_capacity = index_capacity,
-            .index_count = 0,
+            .vertex = try UploadBuffer(Vertex).init(device, 1000, c.SDL_GPU_BUFFERUSAGE_VERTEX),
+            .index = try UploadBuffer(u16).init(device, 2000, c.SDL_GPU_BUFFERUSAGE_INDEX),
+            .clip = try UploadBuffer(ClipRect).init(device, 100, c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ),
             .allocator = allocator,
         };
     }
 
     fn deinit(self: *FrameUploads, device: *c.SDL_GPUDevice) void {
+        _ = device;
         self.draws.deinit(self.allocator);
-        c.SDL_ReleaseGPUTransferBuffer(device, self.vertex_transfer_buffer);
-        c.SDL_ReleaseGPUBuffer(device, self.vertex_gpu_buffer);
-        c.SDL_ReleaseGPUTransferBuffer(device, self.index_transfer_buffer);
-        c.SDL_ReleaseGPUBuffer(device, self.index_gpu_buffer);
+        self.vertex.deinit();
+        self.index.deinit();
+        self.clip.deinit();
     }
 
     fn reset(self: *FrameUploads) void {
-        self.vertex_count = 0;
-        self.index_count = 0;
+        self.clip.reset();
+        self.index.reset();
+        self.vertex.reset();
+
         self.draws.clearRetainingCapacity();
     }
 
     pub fn addUploads(self: *FrameUploads) void {
         const copy_pass = self.copy_pass.?;
 
-        // Upload vertex data to GPU
-        c.SDL_UploadToGPUBuffer(
-            copy_pass,
-            &c.SDL_GPUTransferBufferLocation{
-                .transfer_buffer = self.vertex_transfer_buffer,
-                .offset = 0,
-            },
-            &c.SDL_GPUBufferRegion{
-                .buffer = self.vertex_gpu_buffer,
-                .offset = 0,
-                .size = @intCast(self.vertex_count * @sizeOf(Vertex)),
-            },
-            false,
-        );
-
-        // Upload index data to GPU
-        c.SDL_UploadToGPUBuffer(
-            copy_pass,
-            &c.SDL_GPUTransferBufferLocation{
-                .transfer_buffer = self.index_transfer_buffer,
-                .offset = 0,
-            },
-            &c.SDL_GPUBufferRegion{
-                .buffer = self.index_gpu_buffer,
-                .offset = 0,
-                .size = self.index_count * @sizeOf(u16),
-            },
-            false,
-        );
+        self.vertex.addUploads(copy_pass);
+        self.index.addUploads(copy_pass);
+        self.clip.addUploads(copy_pass);
     }
 
-    fn push(self: *FrameUploads, back: *SDLBackend, backendTexture: ?*BackendTexture, vtx: []const dvui.Vertex, idx: []const u16, maybe_clipr: ?c.SDL_Rect) !void {
-        const device = back.device;
-
-        // Check capacity
-        if (self.vertex_count + vtx.len > self.vertex_capacity or
-            self.index_count + idx.len > self.index_capacity)
-        {
-            return error.BufferFull; // TODO implement resizing
-        }
-
-        // Map and copy vertex data
-
-        const vertex_mapped = c.SDL_MapGPUTransferBuffer(device, self.vertex_transfer_buffer, false) orelse {
-            return error.MapFailed;
-        };
-
-        var s: []Vertex = undefined;
-        s.ptr = @ptrCast(@alignCast(vertex_mapped));
-        s.len = @intCast(self.vertex_capacity);
-
-        const size = back.pixelSize();
-        for (vtx, 0..) |v, i| {
-            s[self.vertex_count + i] = Vertex.fromDvui(v, size);
-        }
-
-        c.SDL_UnmapGPUTransferBuffer(device, self.vertex_transfer_buffer);
-
-        // Map and copy index data (adjusted by vertex offset)
-        const index_offset = self.index_count * @sizeOf(u16);
-
-        const index_mapped = c.SDL_MapGPUTransferBuffer(device, self.index_transfer_buffer, false) orelse {
-            return error.MapFailed;
-        };
-        const index_dest = @as([*]u16, @ptrCast(@alignCast(@as([*]u8, @ptrCast(index_mapped)) + index_offset)));
-
-        // Adjust indices by current vertex count
-        for (idx, 0..) |index, i| {
-            index_dest[i] = @intCast(index + self.vertex_count);
-        }
-        c.SDL_UnmapGPUTransferBuffer(device, self.index_transfer_buffer);
-
+    fn push(self: *FrameUploads, back: *SDLBackend, backendTexture: ?*BackendTexture, vtx: []const dvui.Vertex, idx: []const u16, maybe_clipr: ?ClipRect) !void {
         // Record draw call
         try self.draws.append(self.allocator, .{
-            .index_start = self.index_count,
+            .index_start = self.index.len,
             .index_count = @intCast(idx.len),
             .texture = backendTexture orelse back.white_texture,
-            .clipr = maybe_clipr,
         });
 
-        // Update counts
-        self.vertex_count += @intCast(vtx.len);
-        self.index_count += @intCast(idx.len);
+        const vertex_start: u16 = @intCast(self.vertex.len);
+
+        try self.vertex.ensureCapacityPushCount(vtx.len);
+        try self.index.ensureCapacityPushCount(idx.len);
+        try self.clip.ensureCapacityPushCount(1);
+
+        const size = back.pixelSize();
+        for (vtx) |v| {
+            self.vertex.pushAssumeCap(Vertex.fromDvui(v, size));
+        }
+
+        for (idx) |id| {
+            self.index.pushAssumeCap(id + vertex_start);
+        }
+
+        self.clip.pushAssumeCap(if (maybe_clipr) |clip| clip else .{});
     }
 };
 
@@ -589,7 +664,7 @@ pub fn init(window: *c.SDL_Window, device: *c.SDL_GPUDevice, allocator: std.mem.
         log.err("Failed to create white texture: {any}", .{err});
         @panic("White texture creation failed");
     };
-    back.frame_uploads = FrameUploads.init(device, allocator, 400000, 600000) catch |err| {
+    back.frame_uploads = FrameUploads.init(device, allocator) catch |err| {
         log.err("Failed to create rect uploads: {any}", .{err});
         @panic("FrameUploads creation failed");
     };
@@ -681,13 +756,13 @@ pub fn loadShaders(
         0,
     );
 
-    // Fragment shader: 1 sampler, 0 storage textures, 0 storage buffers, 0 uniform buffers
+    // Fragment shader: 1 sampler, 0 storage textures, 1 storage buffers, 0 uniform buffers
     const fragment_shader = try self.loadShader(
         fragment_data,
         c.SDL_GPU_SHADERSTAGE_FRAGMENT,
         1,
         0,
-        0,
+        1,
         0,
     );
 
@@ -1319,12 +1394,13 @@ pub fn end(self: *SDLBackend) !void {
     }
 
     // Iterate over frame_uploads and bind and render every draw call
-    var vertexBuffer: c.SDL_GPUBufferBinding = .{ .buffer = self.frame_uploads.vertex_gpu_buffer, .offset = 0 };
-    var indexBuffer: c.SDL_GPUBufferBinding = .{ .buffer = self.frame_uploads.index_gpu_buffer, .offset = 0 };
+    var vertexBuffer: c.SDL_GPUBufferBinding = .{ .buffer = self.frame_uploads.vertex.buffer, .offset = 0 };
+    var indexBuffer: c.SDL_GPUBufferBinding = .{ .buffer = self.frame_uploads.index.buffer, .offset = 0 };
 
     c.SDL_BindGPUGraphicsPipeline(self.current_render_pass, self.pipeline);
     c.SDL_BindGPUVertexBuffers(self.current_render_pass, 0, &vertexBuffer, 1);
     c.SDL_BindGPUIndexBuffer(self.current_render_pass, &indexBuffer, c.SDL_GPU_INDEXELEMENTSIZE_16BIT);
+    c.SDL_BindGPUFragmentStorageBuffers(self.current_render_pass, 0, &self.frame_uploads.clip.buffer, 1);
 
     for (self.frame_uploads.draws.items, 0..) |draw, i| {
         var binding = c.SDL_GPUTextureSamplerBinding{
@@ -1372,11 +1448,11 @@ pub fn contentScale(self: *SDLBackend) f32 {
 }
 
 pub fn drawClippedTriangles(self: *SDLBackend, texture: ?dvui.Texture, vtx: []const dvui.Vertex, idx: []const u16, maybe_clipr: ?dvui.Rect.Physical) !void {
-    const clip = if (maybe_clipr) |clipr| c.SDL_Rect{
-        .x = @intFromFloat(clipr.x),
-        .y = @intFromFloat(clipr.y),
-        .w = @intFromFloat(clipr.w),
-        .h = @intFromFloat(clipr.h),
+    const clip = if (maybe_clipr) |clipr| ClipRect{
+        .x = clipr.x,
+        .y = clipr.y,
+        .w = clipr.w,
+        .h = clipr.h,
     } else null;
 
     var backendTexture: ?*BackendTexture = null;

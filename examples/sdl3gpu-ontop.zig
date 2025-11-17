@@ -165,7 +165,7 @@ fn app_init() !void {
         return error.BackendError;
     };
 
-    device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL | c.SDL_GPU_SHADERFORMAT_MSL, false, null) orelse {
+    device = c.SDL_CreateGPUDevice(c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL | c.SDL_GPU_SHADERFORMAT_MSL, true, null) orelse {
         std.debug.print("Failed to create device: {s}\n", .{c.SDL_GetError()});
         return error.BackendError;
     };

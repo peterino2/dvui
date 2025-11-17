@@ -40,6 +40,5 @@ PixelOutput main(PSInput input)
 
     float4 sampled = Texture0.Sample(Sampler0, input.texcoord);
     o.Color = sampled * input.color;
-    o.Color.a = pow(o.Color.a, 1.2/2.2);
     return o;
 }

@@ -828,8 +828,8 @@ pub fn createPipeline(self: *SDLBackend) !void {
         .enable_blend = true,
         .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD,
         .color_blend_op = c.SDL_GPU_BLENDOP_ADD,
-        .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
-        .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+        .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
+        .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE,
         .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
         .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
     };
